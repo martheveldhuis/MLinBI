@@ -1,0 +1,340 @@
+---
+title: "Differentiating gene expression of poor responder patients in comparison to good responders"
+author: Marthe Veldhuis
+---
+
+Import libraries. We chose to use "limma" for differential expression analysis.
+
+```{r}
+
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("limma")
+BiocManager::install("EnhancedVolcano")
+BiocManager::install("org.Hs.eg.db")
+BiocManager::install("clusterProfiler")
+
+install.packages("ggplot2")
+install.packages("statmod")
+install.packages("reshape")
+
+# For plots
+library(ggplot2)
+# for DE analysis
+library(limma)
+# for enhanced volcano plot
+library(EnhancedVolcano)
+# for "melt()"
+library(reshape)
+# for mapping Gene Symbols from data to Gene Entrez IDs
+library("org.Hs.eg.db")
+# for GSEA
+library(clusterProfiler)
+
+
+```
+
+Import the data and meta data. The features are the genes. The samples are the different cells. 
+
+```{r}
+
+working_dir <- getwd()
+file1 <- paste(working_dir, "GSE76312_Giustacchini_Thongjuea_et.al_Nat.Med.RPKM.txt", sep = "/")
+file2 <- paste(working_dir, "GSE76312_Giustacchini-Thongjuea_et.al_Cell_Annotation.txt", sep = "/")
+
+data_original <- read.delim(file1, row.names = 1)
+meta_original <- read.delim(file2, row.names = 1)
+
+rm(file1, file2)
+
+```
+
+- Filter to only include cells from patients that were sequenced at diagnosis time and have a responder status.
+- Remove any zero-expressed genes.
+- Apply a log2 transformation.
+- Add Entrez IDs, for Gene Ontology annotation.
+
+```{r}
+
+# Only keep diagnosis patients, with a good/poor responder status.
+meta_filtered <- subset(meta_original, Stage_1 == "diagnosis" &
+                       (Responder_status == "good" | Responder_status == "poor"))
+
+# Remove any genes that are not expressed.
+data_zero <- data_original[rowSums(data_original) !=0,]
+data_filtered <- subset(data_zero, select = c(row.names(meta_filtered)))
+rm(data_zero)
+
+# Log transform all expression values.
+data_log_transformed <- log2(data_filtered)
+data_log_transformed[data_log_transformed == -Inf] <- 0
+
+# Look up the Entrez IDs for all gene symbols 
+# Note: you can load more information by adding it to the "toType" vector, e.g. GO.
+symbols_to_ids <- bitr(rownames(data_log_transformed), fromType = "SYMBOL", toType = (c("ENTREZID")), OrgDb = "org.Hs.eg.db")
+
+# Create new dataset with Entrez IDs instead.
+data_entrez_ided <- merge(data_log_transformed, symbols_to_ids, by.x = "row.names", by.y = "SYMBOL")
+data_entrez_ided$Row.names <- NULL
+rownames(data_entrez_ided) <- data_entrez_ided$ENTREZID
+data_entrez_ided$ENTREZID <- NULL
+rm(symbols_to_ids)
+
+dim(data_log_transformed)
+dim(data_entrez_ided) # about 8% of genes cannot be changed correctly
+dim(meta_filtered)
+
+```
+
+Define factors. 
+- Good or poor response to TKI treatment.
+- 16 different patients, 11 good responders, and 5 poor responders.
+- 4 different batches.
+
+```{r}
+
+responder_group <- factor(meta_filtered$Responder_status)
+patients <- factor(meta_filtered$Patient_id)
+batches <- factor(meta_filtered$processing_date)
+
+levels(responder_group)
+levels(patients)
+levels(batches)
+
+```
+
+To get an inital idea of the data, we made an MDS plot. 
+Though the different responders do not seem to cluster very separately, a clear batch effect
+
+```{r}
+
+plotMDS(data_log_transformed, labels = meta_filtered$Responder_status, top = 500, ndim = 2,
+        col = ifelse(meta_filtered$Responder_status == "good", "blue", "red"))
+plotMDS(data_log_transformed, labels = meta_filtered$processing_date, top = 100, ndim = 2,
+        col = as.numeric(meta_filtered$processing_date))
+
+```
+
+
+The objective of this analysis is to discover which genes are differentially expressed between good and poor responders. We account for covariates about the patient- and batch origin.
+
+Start by fitting a linear model to the data. This model is specified by the design matrix.
+
+topTable() output:
+- logFC: the log fold-change between good and poor responders.
+- t: the t-statistic used to assess differential expression.
+- P.Value: the p-value for differential expression; this value is not adjusted for multiple testing.
+- adj.P.Val: the p-value adjusted for multiple testing. Different adjustment methods are available, the default is Benjamini-Horchberg.
+
+
+```{r}
+
+# Using factors to model batch and patient variance.
+design <- model.matrix(~0 + responder_group + batches 
+                       + patients, meta_filtered)
+head(design)
+
+# Fit the model
+fit <- lmFit(data_log_transformed, design, correlation = NULL)
+
+# Specify which comparisons between the coefficients are to be extracted from the fit: so what differentiates poor responders from good ones (in that onrder!)
+cont_matrix <- makeContrasts("responder_grouppoor-responder_groupgood",  levels = design) 
+cont_matrix
+
+
+fit <- contrasts.fit(fit, cont_matrix)
+# Empirical Bayes smoothing of standard errors (shrinks standard errors that are much larger or smaller than those from other genes towards the average standard error)
+fit <- eBayes(fit)
+
+# Show top 10 DE genes according to p-value
+top_10 <- topTable(fit, coef=1, n = 10, sort = "P", p = 0.05)
+top_10
+
+top_inf <- topTable(fit, coef=1, n = "Inf", sort = "P", p = 0.05)
+
+# Show summary of amount of up/down regulated genes
+up_down <- decideTests(fit)
+summary(up_down)
+
+
+```
+
+Plot the results.
+
+```{r}
+
+EnhancedVolcano(top_inf, rownames(top_inf), "logFC", "adj.P.Val", 
+                title = "Differentially expressed genes of poor responders", 
+                pCutoff = 10e-7, FCcutoff = 1, pointSize = 1)
+
+```
+
+Find the top 10 genes from the DE analysis in the original (log transformed) data.
+
+```{r}
+
+# Find expression values of top 10 genes
+top_10_expr <- subset(data_log_transformed, row.names(data_log_transformed) %in% rownames(top_10))
+expr <- t(top_10_expr)
+meta_sub <- subset(meta_filtered, select=c(Responder_status))
+top_10_expr <- merge(meta_sub, expr, by = "row.names")
+rm(expr, meta_sub)
+
+# Create a row for each gene
+top_10_expr_melted <- melt(top_10_expr, id.vars = "Responder_status", measure.vars = rownames(top_10))
+colnames(top_10_expr_melted) <- c("responder status", "gene", "expression value")
+
+```
+
+Because there is a lot of zero values (each point has an alpha value of 0.1), it's not very clear in a boxplot.
+Visualize in violin plot instead.
+
+```{r}
+
+ggplot(top_10_expr_melted, aes(x = gene, y = `expression value`, fill = `responder status`)) +
+  geom_boxplot(alpha = 0.1) +
+  scale_fill_manual(values = c("#6be72d", "#ff0000")) 
+
+ggplot(top_10_expr_melted, aes(x = gene, y = `expression value`, fill = `responder status`)) +
+  geom_violin(width = 1.2) +
+  scale_fill_manual(values = c("#6be72d", "#ff0000")) +
+  coord_fixed(ratio = 0.5, ylim = c(-1,1.5))
+
+
+```
+
+Plot the mean expressions of the top 9 differentially expressed genes of poor responders w.r.t. good responders.
+
+```{r}
+
+# Use top 9 instead since the expression of SH3BGRL3 is very high, skewing the plot.
+top_9_expr <- top_10_expr[,1:11]
+
+# Get the mean expression of the 9 genes for good responders
+good_expr <- subset(top_9_expr, Responder_status == "good")
+good_expr$Row.names <- NULL
+good_expr$Responder_status <- NULL
+good_expr <- t(good_expr)
+colnames(good_expr) <- good_expr[1,]
+storage.mode(good_expr) <- "numeric"
+good_means <- rowMeans(good_expr)
+genes <- row.names(good_expr)
+rm(good_expr)
+
+# Get the mean expression of the 9 genes for poor responders
+poor_expr <- subset(top_9_expr, Responder_status == "poor")
+poor_expr$Row.names <- NULL
+poor_expr$Responder_status <- NULL
+poor_expr <- t(poor_expr)
+colnames(poor_expr) <- poor_expr[1,]
+storage.mode(poor_expr) <- "numeric"
+poor_means <- rowMeans(poor_expr)
+rm(poor_expr)
+
+# Combine the two lists of means
+values <- c(poor_means, good_means)
+rm(poor_means, good_means)
+
+# Combine the two statuses
+good_names <- matrix("good", 1, 9)
+poor_names <- matrix("poor", 1, 9)
+status <- c(poor_names, good_names)
+rm(good_names, poor_names)
+
+# Combine everrything into one
+expressions <- cbind(genes)
+expressions <- c(expressions, genes)
+expressions <- rbind(expressions, values)
+expressions <- rbind(expressions, status)
+expressions <- t(expressions)
+rownames(expressions) <- NULL
+expressions <- as.data.frame(expressions)
+rm(genes)
+
+# Plot the mean expressions of the top 10 differentially expressed genes of poor responders w.r.t. good responders.
+ggplot(expressions, aes(x = expressions, y = as.numeric(paste(values)), fill = status)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values = c("#6be72d", "#ff0000")) +
+  ylab("mean log expression" ) +
+  xlab("top 9 DE genes of poor responders w.r.t. good responders")
+
+
+```
+
+Test for over-representation of gene ontology (GO) terms in gene sets.
+Note: Biological Process (BP), Cellular Component (CC), Molecular Function (MF)
+
+```{r}
+
+# Fit using the entrez data, but same design, contrasts, etc.
+fit_entrez <- lmFit(data_entrez_ided, design, correlation = NULL)
+fit_entrez <- contrasts.fit(fit_entrez, cont_matrix)
+fit_entrez <- eBayes(fit_entrez)
+
+# Use limma's goana to find the top GO by p-value
+goana_test_down <- goana(fit_entrez, coef = 1, sort = "P.Down")
+goana_test_up <- goana(fit_entrez, coef = 1, sort = "P.Up")
+ 
+top_goana_down <- topGO(goana_test_down, n = 20, truncate = "50")
+top_goana_up <- topGO(goana_test_up, n = 20, truncate = "50")
+
+```
+
+Visualize the top down- and upregulated GO gene sets, sorted by p value (lowest p-value on top, also indicated by the color).
+
+```{r}
+
+ggplot(top_goana_down, aes(x = reorder(Term, -P.Down), y = as.numeric(Down), fill = -P.Down)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  scale_colour_brewer(palette = "Set1") +
+  labs(fill = "P value") +
+  ylab("Number of down-regulated differentially expressed genes in gene set" ) +
+  xlab("") 
+  
+
+ggplot(top_goana_up, aes(x = reorder(Term, -P.Up), y = as.numeric(Up), fill = -P.Up)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  scale_colour_brewer(palette = "Set1") +
+  labs(fill = "P value") +
+  ylab("Number of up-regulated differentially expressed genes in gene set" ) +
+  xlab("")
+
+```
+
+Gene Set Enrichment Analysis (GSEA) for linear models using rotation tests (ROtation testing using MEan Ranks).
+
+```{r}
+
+# Get information about the gene sets.
+download.file("http://bioinf.wehi.edu.au/software/MSigDB/human_c2_v5p1.rdata", "human_c2_v5p1.rdata", mode = "wb")
+load("human_c2_v5p1.rdata")
+ids_of_group <- Hs.c2
+rm(Hs.c2)
+indices_of_group <- ids2indices(ids_of_group, rownames(data_entrez_ided))
+
+# Apply GSEA using romer.
+romer_res <- romer(data_entrez_ided, indices_of_group, design, 1)
+
+# Get the top 20 "mixed" DE genes.
+top_romer_mixed <- topRomer(romer_res, 20, "mixed")
+top_romer_mixed <- as.data.frame(top_romer_mixed)
+
+```
+
+Visualize the top DE GO gene sets, sorted by p value (lowest p-value on top, also indicated by the color).
+
+```{r}
+
+ggplot(top_romer_mixed, aes(x = reorder(row.names(top_romer_mixed), NGenes), y = as.numeric(NGenes), fill = -Up)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  scale_colour_brewer(palette = "Set1") +
+  labs(fill = "P value") +
+  ylab("Number of differentially expressed genes in gene set" ) +
+  xlab("")
+
+```
+

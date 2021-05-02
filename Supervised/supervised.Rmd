@@ -1,0 +1,639 @@
+---
+  # For the output you can make a html_document, html_notebook, or pdf_document. 
+  # html_notebook is the successor of html_document and has some minor improvements.
+  # If you want to make a pdf_document, you have to comment out the last three options
+  # of the output options. (Shortcut for commenting: Ctrl-Shift-C)
+  # NB: Other useful shortcuts: 
+  # Ctrl-Shift-Enter: Run codeblock; Ctrl-Alt-R: Run whole notebook; Ctrl-Alt-I: Create new block
+  # For preview functionality, use html_notebook. 
+  # (Shortcut for preview: Ctrl-Shift-K, (NB make sure preview is set, not knit))
+  # BTW: Knitting will take very long because it will completely rerun all the code as well.
+  # "secnumdepth" should configure the depth of the numbering of sections, but it doesn't work.
+  
+title: "CS4260: Analysis of single-cell transcriptomics of chronic myeloid leukemia"
+author: "Akash, Hielke, Marthe, Matt"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 5
+    df_print: kable
+    highlight: haddock
+    number_sections: true
+    latex_engine: xelatex
+    secnumdepth: 3  
+    theme: simplex
+    code_folding: "none"
+---
+
+# Supervised learning on responder status (Hielke)
+
+Here, we applied numerous methods to see 
+what supervised learning method would be best to distinguish between 
+different responder statuses.
+
+## Set-up
+
+Loading in the packages.
+```{r loadlib, echo=T, results='hide', message=F, warning=F}
+# Data wrangling
+library(tidyverse)  # collection of packages a.o: ggplot2, tibble, dplyr
+library(magrittr)  # piping
+library(reshape2)
+library(janitor)  # data cleaning
+
+# Plotting
+library(ggplot2)
+# library(gridExtra)
+library(cowplot)  # grid plotting
+
+# Machine learning
+library(MASS)  # LDA, QDA
+library(randomForest)
+library(glmnet)  # elasticnet, LASSO, Ridge
+library(e1071)  # SVM
+
+# Other
+library(readxl)  # Read in data from Excel
+library(glue)  # String formatting
+```
+
+We consider reproducible science to be important.
+
+```{r}
+set.seed(46692)
+```
+
+Data loading.
+
+```{r echo = T, results = 'hide'}
+# Get gene expression data (preprocessed)
+gene_data <- readxl::read_excel("/home/hielke/repos/mlbio/correctedGeneDataSDMR.xlsx")
+gene_data <- column_to_rownames(gene_data, var = "-0.99280765125085602")  # Yeah, this is weird.
+
+# Get meta data_
+meta <- read.csv("/home/hielke/repos/mlbio/Metadata.txt", sep="\t")
+meta <- column_to_rownames(meta, var = "Cell")
+```
+
+## Data wrangling and cleaning
+
+Reform data and cleaning.
+
+```{r}
+rownames(gene_data) %<>% make_clean_names(case = "none")
+genes <- rownames(gene_data)
+gene_data_t <- as_tibble(t(gene_data))
+```
+
+Sort the two dataframes so that they can be compared. (The index is the cell id.)
+
+```{r}
+meta <- meta[sort(rownames(meta)), ]
+gene_data_t <- gene_data_t[sort(rownames(gene_data_t)),]
+```
+
+## Create train and test patients
+
+```{r}
+good_pat <- as_vector(unique((dplyr::filter(meta, Responder_status == "good")$Patient_id)))
+poor_pat <- as_vector(unique((dplyr::filter(meta, Responder_status == "poor")$Patient_id)))
+
+# Randomness controlled by seed
+good_pat_test <- base::sample(good_pat, 2)
+poor_pat_test <- base::sample(poor_pat, 2)
+pat_test <- fct_c(good_pat_test, poor_pat_test)
+
+good_pat_train <- good_pat[!grepl(paste(pat_test, collapse="|"), good_pat)]
+poor_pat_train <- poor_pat[!grepl(paste(pat_test, collapse="|"), poor_pat)]
+pat_train <- fct_c(good_pat_train, poor_pat_train)
+
+# This can be done since the frames are sorted on index.
+gene_data_t$Patient_id <- meta$Patient_id
+gene_data_t$Responder_status <- meta$Responder_status
+
+# Remove "unknown" status (EDIT: Unexplainable bugs came from this.)
+# meta_prog <- dplyr::filter(meta, Responder_status %in% c("good", "poor"))
+# meta_prog$Responder_status %<>% factor
+
+# gene_data_prog <- gene_data_t %>% filter(Responder_status %in% c("good", "poor"))
+# gene_data_prog$Responder_status %<>% factor
+
+# Create test/train set
+gene_data_train <- gene_data_t %>% filter(Patient_id %in% pat_train)
+gene_data_train$Responder_status %<>% factor
+gene_data_test <- gene_data_t %>% filter(Patient_id %in% pat_test)
+gene_data_test$Responder_status %<>% factor
+```
+
+## Utilities
+
+Here a collection of utilities is made that can be used with multiple supervised learning methods.
+
+Create the formula that makes the link between all genes and the Reponder_status. 
+
+```{r}
+Responder_to_allgenes <- formula(paste("Responder_status~", paste(sprintf("`%s`", genes), collapse = "+")))
+```
+
+A function that summarizes the correctly classified cells.
+
+**NB:** We are using tidyval here. 
+So `predicted_labels` cannot be a string, 
+but instead will be turned into a quosure upon evaluating the arguments. 
+[Here](https://cran.r-project.org/web/packages/dplyr/vignettes/programming.html) for more about that.
+
+
+```{r}
+select_correct <- function(gene_data, predicted_labels) {
+  gene_data %>% 
+    group_by(Patient_id) %>% 
+    mutate(cells=n(), correct=sum(Responder_status == !! enquo(predicted_labels))) %>% 
+    summarise_all(first) %>% 
+    # dplyr::select(!(one_of(genes))) %>% 
+    dplyr::select(one_of("Patient_id", "Responder_status", "cells", "correct"))
+}
+```
+
+A function that can visualize the correctly annoted cells versus the wrongly annotated cells.
+
+```{r}
+visualize_classes <- function(correct_classified, title) {
+  
+  # MANGLE
+  
+  correct_classified %<>% mutate(incorrect = cells - correct)
+  
+  split_correct_incorrect <- function(df, filter) {
+    df %>% 
+      filter(Responder_status == filter) %>% 
+      dplyr::select(one_of("Patient_id", "correct", "incorrect")) %>% 
+      melt(id_vars="Patient_id")
+  }
+
+  correct_classified_good <- split_correct_incorrect(correct_classified, "good")
+  correct_classified_poor <- split_correct_incorrect(correct_classified, "poor")
+    
+  
+  # We have crated a correct and an incorrect column, but in the plot 
+  # we want to visualize "poor" and "good".
+  # For _poor the order is already c("correct", "incorrect") ≡ c("poor", "good")
+  # But for _good we have to swap that.
+  correct_classified_good$variable %<>% factor(c("incorrect", "correct"))
+  
+  # PLOT
+  
+  ylim_cells <- round(1.1 * max(c(correct_classified_good$value, correct_classified_poor$value)))
+  
+  # We are creating two plots and put them next to each other.
+  # They share these layers.
+  class_barplot_layers <- list(
+    aes(x = Patient_id, y = value, group = variable, fill = variable),
+    geom_col(position = "dodge"),
+    labs(fill = "Classification"),
+    xlab("Patient ID"),
+    ylab("Amount of cells"),
+    scale_fill_manual(values = c("red", "blue"), labels = c("poor", "good")),
+    theme(legend.position = "none"),
+    ylim(0, ylim_cells),
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  )
+  
+  # Here we create the elements, two plots, and a legend.
+  g_good <- ggplot(correct_classified_good) +
+    labs(title = "Outcome: good") +
+    class_barplot_layers
+    
+  
+  g_poor <- ggplot(correct_classified_poor) + 
+    labs(title = "Outcome: poor") +
+    class_barplot_layers
+  
+  legend <- get_legend(
+    g_poor + theme(legend.position = "right")
+  )
+  
+  title <- ggdraw() + draw_label(title, fontface = "bold", x = 0, hjust = 0) + 
+    theme(plot.margin = ggplot2::margin(0, 0, 0, 7))
+  
+  plot_body <- plot_grid(g_good, g_poor, legend, align = "h", ncol = 3)
+  
+  plot_grid(title, plot_body, ncol = 1, rel_heights = c(.1, 1))
+}
+```
+
+## Different supervised learning methods
+
+### LDA
+
+Use LDA to find the relationship that relates Responder_status to gene expression.
+
+```{r}
+gene_data_lda <- lda(Responder_to_allgenes, data = gene_data_train, CV = FALSE)
+```
+
+#### Verify
+
+Work on train set
+
+```{r}
+gene_data_train$Responder_status_lda <- predict(gene_data_lda)$class
+```
+
+```{r}
+correct_classified_train_lda <- select_correct(gene_data_train, Responder_status_lda)
+correct_classified_train_lda
+```
+
+Work on test set
+
+```{r}
+gene_data_test$Responder_status_lda <- predict(gene_data_lda, newdata = gene_data_test)$class
+```
+
+```{r}
+correct_classified_test_lda <- select_correct(gene_data_test, Responder_status_lda)
+correct_classified_test_lda
+```
+
+
+##### Visualize
+
+###### Train set
+
+It is expected that the train set would perform reasonably well here.
+
+```{r}
+visualize_classes(correct_classified_train_lda, "LDA: Train")
+```
+
+###### Test set
+
+Here we can see how the LDA actually performs, and it does that very poorly.
+
+```{r}
+visualize_classes(correct_classified_test_lda, "LDA: Test")
+```
+
+### Random forest
+
+```{r}
+gene_data_rf <- randomForest(Responder_to_allgenes, data = gene_data_train)
+```
+
+#### Verify
+
+Work on train set
+
+```{r}
+gene_data_train$Responder_status_rf <- predict(gene_data_rf)
+```
+
+```{r}
+correct_classified_train_rf <- select_correct(gene_data_train, Responder_status_rf)
+correct_classified_train_rf
+```
+
+Work on test set
+
+```{r}
+gene_data_test$Responder_status_rf <- predict(gene_data_rf, newdata = gene_data_test)
+```
+
+```{r}
+correct_classified_test_rf <- select_correct(gene_data_test, Responder_status_rf)
+correct_classified_test_rf
+```
+
+
+##### Visualize
+
+###### Train set
+
+It is expected that the train set would perform reasonably well here. 
+However, it seems that for not all patients it makes the true predictions.
+
+```{r}
+visualize_classes(correct_classified_train_rf, "Random Forest: Train")
+```
+
+###### Test set
+
+Here we can see how the Random Forest actually performs, and here it doesn't show anything good either.
+
+```{r}
+visualize_classes(correct_classified_test_rf, "Random Forest: Test")
+```
+
+
+### Intermezzo: Most important genes
+
+The Random Forest does bring something extra to the table and that is 
+that it can give a measure to how importance certain variables are. 
+We can use this to make a stricter subset.
+
+```{r}
+size_important_genes <- 500
+important_genes <- (
+  importance(gene_data_rf) %>% 
+    as_tibble(rownames = NA) %>% 
+    rownames_to_column("gene") %>% 
+    dplyr::arrange(MeanDecreaseGini) %>% 
+    top_n(size_important_genes)
+)$gene
+```
+
+Now we can create another formula for that new relationship
+
+```{r}
+Responder_to_mostimportantgenes <- formula(
+  paste("Responder_status~", paste(sprintf("`%s`", important_genes), collapse = "+"))
+)
+```
+
+
+### LDA with less genes
+
+Now we can attempt to redo the LDA with less genes and see if we improve. 
+We might be able to improve as we were doing pretty well on the train set, but not that well on the test, 
+indicating we are overfitting a little bit.
+
+```{r}
+gene_data_ldamore <- lda(Responder_to_mostimportantgenes, data = gene_data_train, CV = FALSE)
+```
+
+#### Verify
+
+Work on train set
+
+```{r}
+gene_data_train$Responder_status_ldamore <- predict(gene_data_ldamore)$class
+```
+
+```{r}
+correct_classified_train_ldamore <- select_correct(gene_data_train, Responder_status_ldamore)
+correct_classified_train_ldamore
+```
+
+Work on test set
+
+```{r}
+gene_data_test$Responder_status_ldamore <- predict(gene_data_ldamore, newdata = gene_data_test)$class
+```
+
+```{r}
+correct_classified_test_ldamore <- select_correct(gene_data_test, Responder_status_ldamore)
+correct_classified_test_ldamore
+```
+
+
+##### Visualize
+
+###### Train set
+
+It is expected that the train set would perform reasonably well here.
+
+```{r}
+visualize_classes(correct_classified_train_ldamore, glue("LDA ({size_important_genes}): Train"))
+```
+
+###### Test set
+
+Here we can see how the ldamore actually performs, and it does that very poorly.
+
+```{r}
+visualize_classes(correct_classified_test_ldamore, glue("LDA ({size_important_genes}): Test"))
+```
+
+
+### QDA
+
+Instead of linear, we can also attempt quadratic.
+
+**NB:** QDA can be picky, but it should work with the reduced amount of genes and the set seed.
+
+```{r}
+gene_data_qda <- qda(Responder_to_mostimportantgenes, data = gene_data_train)
+```
+
+#### Verify
+
+Work on train set
+
+```{r}
+gene_data_train$Responder_status_qda <- predict(gene_data_qda)$class
+```
+
+```{r}
+correct_classified_train_qda <- select_correct(gene_data_train, Responder_status_qda)
+correct_classified_train_qda
+```
+
+Work on test set
+
+```{r}
+gene_data_test$Responder_status_qda <- predict(gene_data_qda, newdata = gene_data_test)$class
+```
+
+```{r}
+correct_classified_test_qda <- select_correct(gene_data_test, Responder_status_qda)
+correct_classified_test_qda
+```
+
+##### Visualize
+
+###### Train set
+
+It is expected that the train set would perform reasonably well here.
+
+```{r}
+visualize_classes(correct_classified_train_qda, "QDA: Train")
+```
+
+###### Test set
+
+Here we can see how the QDA actually performs, and it does that very well indeed. 
+Also important to note that the poerformance on poor is much more visible on both the train and the test data.
+
+```{r}
+visualize_classes(correct_classified_test_qda, "QDA: Test")
+```
+
+### SVM
+
+```{r}
+gene_data_svm <- svm(Responder_to_mostimportantgenes, data = gene_data_train)
+```
+
+#### Verify
+
+Work on train set
+
+```{r}
+gene_data_train$Responder_status_svm <- predict(gene_data_svm)
+```
+
+```{r}
+correct_classified_train_svm <- select_correct(gene_data_train, Responder_status_svm)
+correct_classified_train_svm
+```
+
+Work on test set
+
+```{r}
+gene_data_test$Responder_status_svm <- predict(gene_data_svm, newdata = gene_data_test)
+```
+
+```{r}
+correct_classified_test_svm <- select_correct(gene_data_test, Responder_status_svm)
+correct_classified_test_svm
+```
+
+
+##### Visualize
+
+###### Train set
+
+SVM is famous for its excellent performance. We can see that it performs indeed very well.
+
+```{r}
+visualize_classes(correct_classified_train_svm, "SVM: Train")
+```
+
+###### Test set
+
+Here we can see how the SVM actually performs, 
+and it does not reasonably well, especially for 'poor' outcome patients.
+
+```{r}
+visualize_classes(correct_classified_test_svm, "SVM: Test")
+```
+
+### Introducing regularization
+
+A way to improve on the classification is to introduce regularization. 
+In essence with regularization you penalize the complexity of your model. 
+As in general, less complex model are often more general models.
+
+Here, we will be using glmnet, which implements the *elasticnet* regularization.
+The *elasticnet* regalarization is a mixed model of rigde and lasso regularization.
+When using *elasticnet*, one can change the paramater α. 
+If this paramater α is equal to 1, this is in essence the lasso model. 
+If this parameter α is instead equal to 0, this is the ridge model.
+
+With *glmnet* we can also quite easy use the logistics regression needed for this binary classification 
+by using the `family = "binomial"` option.
+
+### LASSO
+
+```{r}
+x <- model.matrix(Responder_to_allgenes, gene_data_train)[,-1]
+y <- ifelse(gene_data_train$Responder_status == "good", 1, 0)
+
+x_test <- model.matrix(Responder_to_allgenes, gene_data_test)[,-1]
+```
+
+Another parameter in this model that can be configured is the λ parameter. 
+*glmnet* provides with an easy way to find the best λ parameter using cross validation.
+
+```{r}
+cv_lasso <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+gene_data_lasso <- glmnet(x, y, alpha = 1, family = "binomial", lambda = cv_lasso$lambda.min)
+```
+
+#### Verify
+
+LASSO works slightly different from the previous classifiers as here we actually have probabilities
+instead of the classes. 
+TODO: There might be a better idea to diagnose the patient combining the probabilities. 
+Maybe just taking the mean and than take that number instead as the diagnosis.
+
+```{r}
+gene_data_train$prob_train_lasso <- predict(gene_data_lasso, newx = x, type = "response")
+gene_data_train$Responder_status_lasso <- ifelse(gene_data_train$prob_train_lasso >= .5, "good", "poor")
+```
+
+```{r}
+correct_classified_train_lasso <- select_correct(gene_data_train, Responder_status_lasso)
+correct_classified_train_lasso
+```
+
+Work on test set
+
+```{r}
+gene_data_test$prob_test_lasso <- predict(gene_data_lasso, newx = x_test, type = "response")
+gene_data_test$Responder_status_lasso <- ifelse(gene_data_test$prob_test_lasso >= .5, "good", "poor")
+```
+
+```{r}
+correct_classified_test_lasso <- select_correct(gene_data_test, Responder_status_lasso)
+correct_classified_test_lasso
+```
+
+##### Visualize
+
+###### Train set
+
+LASSO is famous for its excellent performance. We can see that it performs indeed very well.
+
+```{r}
+visualize_classes(correct_classified_train_lasso, "LASSO: Train")
+```
+
+###### Test set
+
+Here we can see how the LASSO actually performs, 
+and it does not reasonably well, especially for 'poor' outcome patients.
+
+```{r}
+visualize_classes(correct_classified_test_lasso, "LASSO: Test")
+```
+
+### Ridge
+
+```{r}
+cv_ridge <- cv.glmnet(x, y, alpha = 0, family = "binomial")
+gene_data_ridge <- glmnet(x, y, alpha = 0, family = "binomial", lambda = cv_ridge$lambda.min)
+```
+
+#### Verify
+
+```{r}
+gene_data_train$prob_train_ridge <- predict(gene_data_ridge, newx = x, type = "response")
+gene_data_train$Responder_status_ridge <- ifelse(gene_data_train$prob_train_ridge >= .5, "good", "poor")
+```
+
+```{r}
+correct_classified_train_ridge <- select_correct(gene_data_train, Responder_status_ridge)
+correct_classified_train_ridge
+```
+
+Work on test set
+
+```{r}
+gene_data_test$prob_test_ridge <- predict(gene_data_ridge, newx = x_test, type = "response")
+gene_data_test$Responder_status_ridge <- ifelse(gene_data_test$prob_test_ridge >= .5, "good", "poor")
+```
+
+```{r}
+correct_classified_test_ridge <- select_correct(gene_data_test, Responder_status_ridge)
+correct_classified_test_ridge
+```
+
+##### Visualize
+
+###### Train set
+
+RIDGE is famous for its excellent performance. We can see that it performs indeed very well.
+
+```{r}
+visualize_classes(correct_classified_train_ridge, "ridge: Train")
+```
+
+###### Test set
+
+Here we can see how the ridge actually performs, 
+and it does not reasonably well, only for 'poor' outcome patients it does work.
+
+```{r}
+visualize_classes(correct_classified_test_ridge, "ridge: Test")
+```

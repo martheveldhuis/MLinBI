@@ -1,0 +1,386 @@
+---
+title: "Progression To Blast Crisis"
+author: "Akash Singh"
+date: "17/04/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Gene reduction to 5000
+
+#CoreGenesSDMRatio contains top 5000 genes with the highest SD to mean ratio and mean being higher than 50th percentile of all gene expression means
+
+coreGenesSDMRExpr <- Dataset_V02[rownames(Dataset_V02) %in% CoreGenesSDMRatio$Gene,]
+
+#Save gene expression data as a matrix
+
+geneMatrixSDMR <- as.matrix(coreGenesSDMRExpr, rownames=TRUE)
+
+#Extract metadata
+
+BCRABL_Status <- droplevels((Metadata)$BCR_ABL_status)
+Stage_1 <- droplevels((Metadata)$Stage_1)
+Stage_2 <- droplevels((Metadata)$Stage_2)
+Patient_id <- droplevels((Metadata)$Patient_id)
+Responder_status <- droplevels((Metadata)$Responder_status)
+Batch <- droplevels((Metadata)$processing_date)
+
+#Create metadata data.frame
+
+metadata <- data.frame("BCRABL_Status" = BCRABL_Status,
+                          "Stage_1" = Stage_1,
+                          "Stage_2" = Stage_2,
+			"Patient_id" = Patient_id,
+			"Responder_status" = Responder_status,
+			"Batch" = Batch)
+
+#Create SummarizedExperiment instance
+
+CoreGenesSDMR <- SummarizedExperiment(assays = list(geneMatrixSDMR),colData = metadata)
+
+batchCoreGenes = colData(CoreGenes)$Batch
+
+# Remove Batch Effect
+
+#Set cluster colors according to batch
+
+col_clus <- c("Red", "darkorchid2", "cyan", "green", "blue", "yellow")
+names(col_clus) <- sort(unique(Batch))
+
+#PCA
+
+library(ade4)
+library(ggplot2)
+pcaCoreGenesSDMR = dudi.pca(t(assay(CoreGenesSDMR)), nf = 3, scannf = FALSE)
+
+#Screeplot
+
+library(tibble)
+plotbar(pcaCoreGenesSDMR, 15)
+
+#Pick top 3 components
+
+PCCoreGenesSDMR = pcaCoreGenesSDMR$li[,1:3]
+
+#Plot
+
+plot3d(PCCoreGenesSDMR,aspect=sqrt(c(84,24,20)),col=col_clus[batch])
+
+#Log transform all data
+
+coreGenesSDMRLog <- as.data.frame(log(coreGenesSDMRExpr[,1:2287] + 1))
+
+#Save as matrix
+
+geneMatrixSDMRLog <- as.matrix(coreGenesSDMRLog, rownames=TRUE)
+
+#Centralized all batch data
+
+model0 = model.matrix(~1, Batch)
+centralizedCoreGenesSDMR = ComBat(dat = geneMatrixSDMRLog, batch = Batch, mod = model0)
+
+#Save as dataframe
+
+geneDataSDMR <- data.frame(centralizedCoreGenesSDMR)
+
+#Export to excel
+
+library(openxlsx)
+write.xlsx(geneDataSDMR, "correctedGeneDataSDMR.xlsx")
+
+#Create new SummarizedExperiment instance
+
+correctedCoreGenesSDMR <- SummarizedExperiment(assays = list(centralizedCoreGenesSDMR),colData = metadata)
+
+#PCA
+
+pcaCorrectedCoreGenesSDMR = dudi.pca(t(assay(correctedCoreGenesSDMR)), nf = 3, scannf = FALSE)
+
+#Screeplot
+
+plotbar(pcaCorrectedCoreGenesSDMR, 15)
+
+#Pick top 3 components
+
+PCCorrectedCoreGenesSDMR = pcaCorrectedCoreGenesSDMR$li[,1:3]
+
+#Plot
+
+plot3d(PCCorrectedCoreGenesSDMR,aspect=sqrt(c(84,24,20)),col=col_clus[Batch])
+
+# Analyse patient data with observations available at multiple instances
+
+#Subsetting 5K gene data for patients with temporal data
+
+temporalPatientsData = correctedCoreGenesSDMR[, correctedCoreGenesSDMR$Patient_id %in% TemporalPatients$PatientID]
+
+#Subset only diagnosis or pre_blast_crisis cases
+
+temporalPatientsDataT0 = temporalPatientsData[, temporalPatientsData$Stage_1 %in% c("diagnosis", "pre_blast_crisis")]
+
+#Extract metadata
+
+BCRABL_StatusT0 <- ((MetadataTemporalT0)$BCR_ABL_status)
+Stage_1T0 <- ((MetadataTemporalT0)$Stage_1)
+Stage_2T0 <- ((MetadataTemporalT0)$Stage_2)
+Patient_idT0 <- ((MetadataTemporalT0)$Patient_id)
+Responder_statusT0 <- ((MetadataTemporalT0)$Responder_status)
+BatchT0 <- ((MetadataTemporalT0)$processing_date)
+
+#Create metadata data.frame
+
+metadataTemporalT0 <- data.frame("BCRABL_Status" = BCRABL_StatusT0,
+                          "Stage_1" = Stage_1T0,
+                          "Stage_2" = Stage_2T0,
+			"Patient_id" = Patient_idT0,
+			"Responder_status" = Responder_statusT0,
+			"Batch" = BatchT0)
+
+# Visualise selected patients' data using UMAP and PCA
+
+#Load UMAP
+
+library(umap)
+
+#Configure for 3 dimensions
+
+custom.config = umap.defaults
+custom.config$n_components = 3
+
+#Perform UMAP
+
+temporalPatientsT0.UMAP <- umap(t(assay(temporalPatientsDataT0)), custom.config)
+
+#Stage_2 labelling
+
+colClusStage_2_T0 <- c("green", "red")
+names(colClusStage_2_T0) <- sort(unique(Stage_2T0))
+
+#Plot 
+
+plot3d(temporalPatientsT0.UMAP$layout,aspect=sqrt(c(84,24,20)),col=colClusStage_2_T0[Stage_2T0])
+
+#Perform PCA
+
+library(ade4)
+pcaTemporalPatientsT0 = dudi.pca(t(assay(temporalPatientsDataT0)), nf = 3, scannf = FALSE)
+
+library(tibble)
+plotbar(pcaTemporalPatientsT0, 15)
+
+PCTemporalPatientsT0 = pcaTemporalPatientsT0$li[,1:3]
+
+plot3d(PCTemporalPatientsT0, aspect=sqrt(c(84,24,20)), col=colClusStage_2_T0[Stage_2T0])
+
+# Train Random-Forest Classifier
+
+#Export gene data for annotation
+
+library(openxlsx)
+write.xlsx(tempMatrix, "temporalPatientsDataT0.xlsx", row.names = TRUE)
+
+#Random Forest
+
+install.packages("randomForest")
+library(randomForest)
+
+#Split into train and validation
+
+set.seed(100)
+train <- sample(nrow(RandomFDataAnnotated), 0.75*nrow(rfData00), replace = FALSE)
+TrainSet <- RandomFDataAnnotated[train,1:5001]
+ValidSet <- RandomFDataAnnotated[-train,1:5001]
+
+TrainLabels <- as.factor(TrainSet$Stage2)
+RandomFModel01 <- randomForest(x = TrainSet[,1:5000], y = TrainLabels, importance = TRUE)
+RandomFModel01 # OOB estimate of  error rate: 0.61%
+
+#Predict on Train data
+
+predTrain <- predict(RandomFModel01, TrainSet, type = "class")
+table(predTrain, TrainSet$Stage2)
+
+#Predict on Test data
+
+predValid <- predict(RandomFModel01, ValidSet[1:5000], type = "class")
+table(predValid,ValidSet$Stage2)
+
+#Get gene importance
+
+GeneImportanceRandomF <- importance(RandomFModel01)
+
+#Cross validation
+
+install.packages("rfUtilities")
+AllLabels <- TrainSet$Stage2
+RFCrossValidation <- rfUtilities::rf.crossValidation(RandomFModel01, xdata = TrainSet[,1:5000], ydata = AllLabels)
+
+
+# Visualise top 1500 random forest genes
+
+#Subsetting T0 data on top 1500 Genes from Random Forest
+
+tempMatrixV02 <- tempMatrix[rownames(tempMatrix) %in% ImportantGenesRandomF1500$Gene,]
+
+#Extract metadata
+
+BCRABL_StatusT0 <- ((MetadataTemporalT0)$BCR_ABL_status)
+Stage_1T0 <- ((MetadataTemporalT0)$Stage_1)
+Stage_2T0 <- ((MetadataTemporalT0)$Stage_2)
+Patient_idT0 <- ((MetadataTemporalT0)$Patient_id)
+Responder_statusT0 <- ((MetadataTemporalT0)$Responder_status)
+BatchT0 <- ((MetadataTemporalT0)$processing_date)
+
+#Create metadata data.frame
+
+metadataTemporalT0 <- data.frame("BCRABL_Status" = BCRABL_StatusT0,
+                          "Stage_1" = Stage_1T0,
+                          "Stage_2" = Stage_2T0,
+			"Patient_id" = Patient_idT0,
+			"Responder_status" = Responder_statusT0,
+			"Batch" = BatchT0)
+
+#Create Summarized Experiment
+
+temporalDataT01500RFGenes <- SummarizedExperiment(assays = list(tempMatrixV02), colData = metadataTemporalT0)
+
+#Load UMAP
+
+library(umap)
+
+#Configure for 3 dimensions
+
+custom.config = umap.defaults
+custom.config$n_components = 3
+
+#Perform UMAP
+
+temporalDataT01500RFGenes.UMAP <- umap(t(assay(temporalDataT01500RFGenes)), custom.config)
+
+#Stage_2 labelling
+
+colClusStage_2_T0 <- c("green", "red")
+names(colClusStage_2_T0) <- sort(unique(Stage_2T0))
+
+#Plot 
+
+plot3d(temporalDataT01500RFGenes.UMAP$layout,aspect=sqrt(c(84,24,20)),col=colClusStage_2_T0[Stage_2T0])
+
+
+# SVM on top 5000 genes
+
+install.packages("e1071")
+library("e1071")
+
+#Split into train and validation
+
+set.seed(100)
+train <- sample(nrow(RandomFDataAnnotated), 0.75*nrow(rfData00), replace = FALSE)
+SVMTrainSetBIG <- RandomFDataAnnotated[train,1:5001]
+SVMTestSetBIG <- RandomFDataAnnotated[-train,1:5001]
+
+svmModel01BIG <- svm(SVMTrainSetBIG[1:5000], SVMTrainSet$Stage2, kernel = "linear", type = "C")
+summary(svmModel01BIG)
+
+#Predict on train data
+
+predBIG <- predict(svmModel01BIG, SVMTrainSetBIG[1:5000])
+table(predBIG, SVMTrainSetBIG$Stage2)
+
+#Predict on test data
+
+predBIG <- predict(svmModel01BIG, SVMTestSetBIG[1:5000])
+table(predBIG, SVMTestSetBIG$Stage2)
+
+#Extract weight of genes
+
+W <- t(svmModel01BIG$coefs) %*% svmModel01BIG$SV
+write.xlsx(W, "SVM_Gene_WeightsBIG.xlsx", row.names = TRUE)
+
+
+# Visualising top 1500 SVM genes
+
+#Subsetting T0 data on top 1500 Genes from Full SVM
+
+tempMatrixV02 <- tempMatrix[rownames(tempMatrix) %in% ImportantGenesFullSVM$Gene,]
+
+#Extract metadata
+
+BCRABL_StatusT0 <- ((MetadataTemporalT0)$BCR_ABL_status)
+Stage_1T0 <- ((MetadataTemporalT0)$Stage_1)
+Stage_2T0 <- ((MetadataTemporalT0)$Stage_2)
+Patient_idT0 <- ((MetadataTemporalT0)$Patient_id)
+Responder_statusT0 <- ((MetadataTemporalT0)$Responder_status)
+BatchT0 <- ((MetadataTemporalT0)$processing_date)
+
+#Create metadata data.frame
+
+metadataTemporalT0 <- data.frame("BCRABL_Status" = BCRABL_StatusT0,
+                          "Stage_1" = Stage_1T0,
+                          "Stage_2" = Stage_2T0,
+			"Patient_id" = Patient_idT0,
+			"Responder_status" = Responder_statusT0,
+			"Batch" = BatchT0)
+
+#Create Summarized Experiment
+
+temporalDataT0FullSVMGenes <- SummarizedExperiment(assays = list(tempMatrixV02), colData = metadataTemporalT0)
+
+#PCA
+
+library(ade4)
+pcaFullSVMGenes = dudi.pca(t(assay(temporalDataT0FullSVMGenes)), nf = 3, scannf = FALSE)
+
+library(tibble)
+plotbar(pcaFullSVMGenes, 15)
+
+PCFullSVMGenes = pcaFullSVMGenes$li[,1:3]
+
+plot3d(PCFullSVMGenes, aspect=sqrt(c(84,24,20)), col=colClusStage_2_T0[Stage_2T0])
+
+
+# Clustering on cells from two instances, using top 1500 SVM genes
+
+#Subset on top SVM genes
+
+temporalPatientsMatrixV02 <- temporalPatientsMatrix[rownames(temporalPatientsMatrix) %in% ImportantGenesFullSVM$Gene,]
+
+#Extract metadata
+
+BCRABL_StatusTemporal <- (MetadataTemporal$BCR_ABL_status)
+Stage_1Temporal <- ((MetadataTemporal)$Stage_1)
+Stage_2Temporal <- ((MetadataTemporal)$Stage_2)
+Patient_idTemporal <- ((MetadataTemporal)$Patient_id)
+Responder_statusTemporal <- ((MetadataTemporal)$Responder_status)
+BatchTemporal <- ((MetadataTemporal)$processing_date)
+
+#Create metadata data.frame
+
+metadataTemporal <- data.frame("BCRABL_Status" = BCRABL_StatusTemporal,
+                          "Stage_1" = Stage_1Temporal,
+                          "Stage_2" = Stage_2Temporal,
+			"Patient_id" = Patient_idTemporal,
+			"Responder_status" = Responder_statusTemporal,
+			"Batch" = BatchTemporal)
+
+#Create Summarized Experiment
+
+temporalPatientsDataSVM <- SummarizedExperiment(assays = list(temporalPatientsMatrixV02),
+                              colData = metadataTemporal)
+
+#PCA
+
+library(ade4)
+pcaSVMGenesAllTemporal = dudi.pca(t(assay(temporalPatientsDataSVM)), nf = 3, scannf = FALSE)
+
+library(tibble)
+plotbar(pcaSVMGenesAllTemporal, 15)
+
+PCSVMAllTemporal = pcaSVMGenesAllTemporal$li[,1:3]
+
+plot3d(PCSVMAllTemporal, aspect=sqrt(c(84,24,20)), col=colClusStage2_Temporal[Stage_2Temporal])
